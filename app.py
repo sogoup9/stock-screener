@@ -1,6 +1,8 @@
 import re
 import time
 import warnings
+from datetime import datetime, timedelta
+from io import StringIO
 
 import numpy as np
 import pandas as pd
@@ -10,7 +12,109 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="飆股選股器 V2", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="飆股獵奇-傑森", page_icon="🦅", layout="wide")
+
+# =========================
+# 網站外觀＋上方導覽列
+# =========================
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: #FFF7ED;
+    }
+    [data-testid="stHeader"] {
+        background: rgba(255,247,237,0.96);
+    }
+    .top-nav {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 14px;
+        margin: 0 0 18px 0;
+        background: #FFE8CC;
+        border: 1px solid #F5D3AD;
+        border-radius: 14px;
+        box-shadow: 0 2px 10px rgba(160, 100, 40, 0.08);
+        overflow-x: auto;
+        white-space: nowrap;
+    }
+    .brand-logo {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 13px;
+        margin-right: 8px;
+        color: #7A3E00;
+        font-weight: 800;
+        font-size: 17px;
+        text-decoration: none;
+    }
+    .brand-icon {
+        width: 32px;
+        height: 32px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 50%;
+        background: #FFFDF8;
+        border: 1px solid #E8B77F;
+        font-size: 18px;
+    }
+    .nav-item {
+        display: inline-flex;
+        align-items: center;
+        padding: 8px 13px;
+        border-radius: 10px;
+        color: #633A1C;
+        text-decoration: none;
+        font-weight: 650;
+    }
+    .nav-item:hover {
+        background: #FFF7ED;
+        color: #9A4D00;
+    }
+    .nav-sep {
+        color: #B9855A;
+        font-weight: 700;
+    }
+    .page-card {
+        background: #FFFFFF;
+        border: 1px solid #F1D9C1;
+        border-radius: 14px;
+        padding: 18px 20px;
+        margin-bottom: 16px;
+        box-shadow: 0 2px 10px rgba(120,80,40,0.05);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+page = str(st.query_params.get("page", "home")).strip().lower()
+if page not in {"home", "events", "futures"}:
+    page = "home"
+
+# 品牌獨立放在左上角；導覽列只保留功能頁面。
+st.markdown(
+    """
+    <div style="margin:2px 0 8px 2px;">
+      <a class="brand-logo" href="?page=home" target="_self" style="padding-left:0;">
+        <span class="brand-icon">🦅</span>
+        <span>飆股獵奇-傑森</span>
+      </a>
+    </div>
+    <div class="top-nav">
+      <a class="nav-item" href="?page=home" target="_self">首頁</a>
+      <span class="nav-sep">›</span>
+      <a class="nav-item" href="?page=events" target="_self">近期事件（處置／除權息）</a>
+      <span class="nav-sep">›</span>
+      <a class="nav-item" href="?page=futures" target="_self">海期日記</a>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # =========================
 # 官方資料來源
@@ -873,6 +977,415 @@ def render_adsense(slot, height=125):
 
 
 # =========================
+# 近期事件：處置／除權息
+# =========================
+@st.cache_data(ttl=900, show_spinner=False)
+def load_twse_disposal():
+    """TWSE 官方 OpenAPI：集中市場公布處置股票。"""
+    url = f"{TWSE}/announcement/punish"
+    data = fetch_json(url)
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    rename = {
+        "Number": "序號",
+        "Date": "公布日期",
+        "Code": "股票代號",
+        "Name": "股票名稱",
+        "NumberOfAnnouncement": "累計次數",
+        "ReasonsOfDisposition": "處置條件",
+        "DispositionPeriod": "處置起迄",
+        "DispositionMeasures": "處置措施",
+    }
+    df = df.rename(columns=rename)
+    keep = [c for c in rename.values() if c in df.columns]
+    return df[keep].copy()
+
+
+def _read_html_tables(url):
+    try:
+        r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        return pd.read_html(StringIO(r.text))
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_twse_exrights():
+    """TWSE 官方除權除息預告表。"""
+    url = "https://www.twse.com.tw/exchangeReport/TWT48U?response=html"
+    tables = _read_html_tables(url)
+    if not tables:
+        return pd.DataFrame()
+    # 通常第一個表就是預告表；若版型變動，挑出含股票代號的表。
+    table = tables[0]
+    for t in tables:
+        text = " ".join(map(str, t.columns)) + " " + " ".join(map(str, t.head(2).astype(str).values.flatten()))
+        if "股票代號" in text and "除權除息日期" in text:
+            table = t
+            break
+    df = table.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ["".join(str(x) for x in col if str(x) != "nan").strip() for col in df.columns]
+    df.columns = [str(c).replace("<br>", "").strip() for c in df.columns]
+    # 常見欄位名稱整理
+    mapping = {}
+    for c in df.columns:
+        cc = str(c)
+        if "除權除息日期" in cc:
+            mapping[c] = "除權息日期"
+        elif cc in ("股票代號", "代號") or "股票代號" in cc:
+            mapping[c] = "股票代號"
+        elif cc in ("名稱", "股票名稱"):
+            mapping[c] = "股票名稱"
+        elif "除權息" in cc and "日期" not in cc:
+            mapping[c] = "權息別"
+        elif "現金股利" in cc:
+            mapping[c] = "現金股利"
+        elif "無償配股率" in cc:
+            mapping[c] = "無償配股率"
+    df = df.rename(columns=mapping)
+    wanted = ["除權息日期", "股票代號", "股票名稱", "權息別", "無償配股率", "現金股利"]
+    wanted = [c for c in wanted if c in df.columns]
+    if not wanted:
+        return pd.DataFrame()
+    return df[wanted].copy()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_tpex_disposal_html():
+    """TPEx 官方處置股票頁；若官方頁面拒絕自動抓取，保留空表並提供官方查詢連結。"""
+    url = "https://www.tpex.org.tw/zh-tw/announcement/mainboard/disposal.html"
+    tables = _read_html_tables(url)
+    if not tables:
+        return pd.DataFrame()
+    for t in tables:
+        text = " ".join(map(str, t.columns)) + " " + " ".join(map(str, t.head(2).astype(str).values.flatten()))
+        if "證券代號" in text and "處置" in text:
+            return t.copy()
+    return tables[0].copy() if tables else pd.DataFrame()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_tpex_exrights_html():
+    """TPEx 官方除權除息公告頁。"""
+    url = "https://www.tpex.org.tw/zh-tw/announce/market/ex/announce.html"
+    tables = _read_html_tables(url)
+    if not tables:
+        return pd.DataFrame()
+    for t in tables:
+        text = " ".join(map(str, t.columns)) + " " + " ".join(map(str, t.head(2).astype(str).values.flatten()))
+        if "除權" in text or "除息" in text:
+            return t.copy()
+    return tables[0].copy() if tables else pd.DataFrame()
+
+
+def parse_roc_date(value):
+    """將民國年月日字串轉成 pandas Timestamp；支援 115/09/30、11509030、2026/09/30。"""
+    if value is None:
+        return pd.NaT
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "nat", "-"}:
+        return pd.NaT
+    # 先處理含民國日期的字串；只抓第一組完整日期。
+    m = re.search(r"(\d{3})[\-/年](\d{1,2})[\-/月](\d{1,2})", text)
+    if m:
+        try:
+            return pd.Timestamp(int(m.group(1)) + 1911, int(m.group(2)), int(m.group(3)))
+        except Exception:
+            return pd.NaT
+    m = re.search(r"(\d{3})(\d{2})(\d{2})", text)
+    if m:
+        try:
+            return pd.Timestamp(int(m.group(1)) + 1911, int(m.group(2)), int(m.group(3)))
+        except Exception:
+            return pd.NaT
+    # 西元日期
+    m = re.search(r"(20\d{2})[\-/](\d{1,2})[\-/](\d{1,2})", text)
+    if m:
+        try:
+            return pd.Timestamp(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except Exception:
+            return pd.NaT
+    return pd.to_datetime(text, errors="coerce")
+
+
+def parse_disposition_end(value):
+    """從處置起迄文字取最後一個日期，作為處置結束日。"""
+    if value is None:
+        return pd.NaT
+    text = str(value).strip()
+    matches = re.findall(r"(?:\d{3}[\-/年]\d{1,2}[\-/月]\d{1,2}|\d{3}\d{4}|20\d{2}[\-/]\d{1,2}[\-/]\d{1,2})", text)
+    if not matches:
+        return pd.NaT
+    return parse_roc_date(matches[-1])
+
+
+def _normalize_event_code(value):
+    m = re.search(r"\b(\d{4})\b", str(value or ""))
+    return m.group(1) if m else clean_code(value)
+
+
+def make_event_stock_link(code, name, market="listed"):
+    code = _normalize_event_code(code)
+    name = str(name or code)
+    return f'<a href="?page=events&event_stock={code}&event_market={market}" target="_self" style="text-decoration:none;font-weight:700;color:#9A4D00;">{name}</a>'
+
+
+def render_disposition_detail(code, market, event_name="", end_date=pd.NaT):
+    """處置股詳細頁：日K＋布林通道＋處置結束日標記。"""
+    code = _normalize_event_code(code)
+    market = "otc" if str(market).lower() in {"otc", "上櫃", "tpex"} else "listed"
+    title_market = "上櫃" if market == "otc" else "上市"
+
+    if st.button("← 回到近期事件", key="back_event_detail"):
+        st.query_params.clear()
+        st.query_params["page"] = "events"
+        st.rerun()
+
+    st.markdown(f"### 🚨 {code} {event_name}｜處置股日線分析")
+    if pd.notna(end_date):
+        st.info(f"處置結束日：**{end_date.strftime('%Y-%m-%d')}**（{title_market}）")
+    else:
+        st.warning("目前無法從官方處置資料解析處置結束日，因此圖表不會標示結束日期。")
+
+    daily = load_daily(code, market)
+    if daily.empty:
+        st.error("目前抓不到這檔股票的 Yahoo Finance 日線資料，請稍後再試。")
+        return
+
+    daily = daily.copy()
+    daily.index = pd.to_datetime(daily.index, errors="coerce")
+    daily = daily[daily.index.notna()].sort_index()
+    daily = add_bollinger(daily)
+
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=daily.index,
+        open=daily["Open"], high=daily["High"], low=daily["Low"], close=daily["Close"],
+        name="日K",
+        increasing_line_color="#d64545", increasing_fillcolor="#d64545",
+        decreasing_line_color="#159957", decreasing_fillcolor="#159957",
+    ))
+    for col, name in [("BB_MID", "布林中軌"), ("BB_UPPER", "布林上軌"), ("BB_LOWER", "布林下軌")]:
+        if col in daily.columns:
+            fig.add_trace(go.Scatter(x=daily.index, y=daily[col], mode="lines", name=name))
+
+    if pd.notna(end_date):
+        end_ts = pd.Timestamp(end_date).normalize()
+        fig.add_vline(
+            x=end_ts,
+            line_width=2,
+            line_dash="dash",
+            line_color="#E67E22",
+        )
+        fig.add_annotation(
+            x=end_ts,
+            y=1,
+            yref="paper",
+            text=f"處置結束 {end_ts.strftime('%Y-%m-%d')}",
+            showarrow=False,
+            xanchor="left",
+            yanchor="top",
+            bgcolor="#FFF0DE",
+            bordercolor="#E67E22",
+            borderwidth=1,
+            font=dict(color="#8A4B08", size=12),
+        )
+
+    fig.update_layout(
+        title=dict(text=f"{code} {event_name}｜日K＋布林通道", x=0.01, xanchor="left", font=dict(size=18)),
+        height=560,
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        plot_bgcolor="#ffffff", paper_bgcolor="#ffffff",
+        font=dict(family="Arial, Microsoft JhengHei, sans-serif", size=12, color="#263238"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+        xaxis=dict(showgrid=True, gridcolor="#edf0f2", showspikes=True, spikemode="across"),
+        yaxis=dict(showgrid=True, gridcolor="#edf0f2"),
+        margin=dict(l=45, r=20, t=70, b=35),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    recent = daily.tail(60).copy().sort_index(ascending=False)
+    recent.index = recent.index.strftime("%Y-%m-%d")
+    cols = [c for c in ["Open", "High", "Low", "Close", "Volume", "BB_MID", "BB_UPPER", "BB_LOWER"] if c in recent.columns]
+    st.markdown("**最近60個交易日（新 → 舊）**")
+    st.dataframe(recent[cols].round(2), use_container_width=True)
+
+
+def render_disposition_table(df, market, title):
+    if df.empty:
+        st.warning(f"目前無法直接取得 {title} 處置資料，請使用下方官方查詢。")
+        return
+    x = df.copy()
+    # 常見欄位標準化
+    code_col = next((c for c in x.columns if c in ["股票代號", "證券代號", "代號"] or "代號" in str(c)), None)
+    name_col = next((c for c in x.columns if c in ["股票名稱", "證券名稱", "名稱"] or "名稱" in str(c)), None)
+    period_col = next((c for c in x.columns if c in ["處置起迄", "處置期間", "處置日期"] or "處置" in str(c) and ("期" in str(c) or "迄" in str(c))), None)
+    if code_col is None:
+        st.dataframe(x, use_container_width=True, hide_index=True)
+        return
+    # 只保留有四碼股票代號的資料
+    x["_code"] = x[code_col].map(_normalize_event_code)
+    x = x[x["_code"].str.len().eq(4)].copy()
+    if x.empty:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        return
+    html_cols = [c for c in x.columns if c != "_code"]
+    st.markdown(f"**{title}**")
+    html = ['<div style="overflow-x:auto;border:1px solid #ead9c8;border-radius:12px;background:#fff;">', '<table style="width:100%;border-collapse:collapse;font-size:14px;white-space:nowrap;">', '<thead><tr style="background:#fff1e2;">']
+    for c in html_cols:
+        html.append(f'<th style="padding:10px 9px;border-bottom:1px solid #ead9c8;text-align:left;">{c}</th>')
+    html.append('</tr></thead><tbody>')
+    for _, r in x.iterrows():
+        code = r["_code"]
+        name = r[name_col] if name_col else code
+        vals=[]
+        for c in html_cols:
+            val = r[c]
+            if c == name_col:
+                val = make_event_stock_link(code, name, market)
+            elif pd.isna(val):
+                val = "-"
+            else:
+                val = str(val)
+            vals.append(f'<td style="padding:9px;border-bottom:1px solid #f3eee8;">{val}</td>')
+        html.append('<tr>' + ''.join(vals) + '</tr>')
+    html.append('</tbody></table></div>')
+    st.markdown(''.join(html), unsafe_allow_html=True)
+    st.info("💡 點擊處置股票名稱，可查看日K、布林通道與處置結束日。")
+
+
+def render_events_page():
+    event_stock = str(st.query_params.get("event_stock", "")).strip()
+    event_market = str(st.query_params.get("event_market", "listed")).strip().lower()
+
+    if event_stock:
+        twse = load_twse_disposal()
+        tpex = load_tpex_disposal_html()
+        source = twse if event_market == "listed" else tpex
+        event_name = event_stock
+        end_date = pd.NaT
+        if not source.empty:
+            code_col = next((c for c in source.columns if c in ["股票代號", "證券代號", "代號"] or "代號" in str(c)), None)
+            name_col = next((c for c in source.columns if c in ["股票名稱", "證券名稱", "名稱"] or "名稱" in str(c)), None)
+            period_col = next((c for c in source.columns if c in ["處置起迄", "處置期間", "處置日期"] or ("處置" in str(c) and ("期" in str(c) or "迄" in str(c)))), None)
+            if code_col:
+                hit = source[source[code_col].map(_normalize_event_code).eq(_normalize_event_code(event_stock))]
+                if not hit.empty:
+                    if name_col:
+                        event_name = str(hit.iloc[0][name_col])
+                    if period_col:
+                        end_date = parse_disposition_end(hit.iloc[0][period_col])
+        render_disposition_detail(event_stock, event_market, event_name, end_date)
+        return
+
+    st.title("📅 近期事件")
+    st.caption("處置／除權息｜資料優先採用 TWSE、TPEx 官方資料；更新時間依官方公告。")
+
+    today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.caption(f"本頁資料查詢時間：{today}")
+
+    tab1, tab2 = st.tabs(["🚨 處置股票", "💰 除權息"])
+
+    with tab1:
+        st.markdown("### 🚨 近期處置股票")
+        st.info("處置資料用來提醒交易撮合方式、預收款券等限制，實際規則以交易所公告為準。")
+
+        twse = load_twse_disposal()
+        if not twse.empty and "公布日期" in twse.columns:
+            twse["公布日期"] = twse["公布日期"].astype(str).str.replace(r"^(\d{3})(\d{2})(\d{2})$", r"\1/\2/\3", regex=True)
+        render_disposition_table(twse, "listed", "上市｜TWSE")
+
+        tpex = load_tpex_disposal_html()
+        render_disposition_table(tpex, "otc", "上櫃｜TPEx")
+        st.link_button("🔗 開啟 TPEx 官方處置股票查詢", "https://www.tpex.org.tw/zh-tw/announcement/mainboard/disposal.html", use_container_width=True)
+        st.link_button("🔗 開啟 TWSE 官方處置股票查詢", "https://www.twse.com.tw/rwd/zh/announcement/punish?response=html", use_container_width=True)
+
+    with tab2:
+        st.markdown("### 💰 近期除權息")
+        st.info("除權息日期、股利及配股資料以交易所最新公告為準。")
+
+        twse_ex = load_twse_exrights()
+        if not twse_ex.empty:
+            # 只保留未來約 60 天與近期 14 天，讓頁面不會塞滿歷史資料。
+            if "除權息日期" in twse_ex.columns:
+                raw = twse_ex["除權息日期"].astype(str)
+                # 交易所日期常為民國年；將 115年10月08日 轉成可排序日期。
+                def roc_to_date(v):
+                    m = re.search(r"(\d{3})年(\d{1,2})月(\d{1,2})日", v)
+                    if not m:
+                        m = re.search(r"(\d{3})/(\d{1,2})/(\d{1,2})", v)
+                    if not m:
+                        return pd.NaT
+                    return pd.Timestamp(int(m.group(1)) + 1911, int(m.group(2)), int(m.group(3)))
+                dt = raw.map(roc_to_date)
+                start = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=14)
+                end = pd.Timestamp(datetime.now().date()) + pd.Timedelta(days=60)
+                mask = dt.between(start, end)
+                view = twse_ex.loc[mask].copy()
+                view.insert(0, "排序日期", dt.loc[mask].dt.strftime("%Y-%m-%d"))
+                view = view.sort_values("排序日期")
+                view = view.drop(columns=["排序日期"])
+            else:
+                view = twse_ex.copy()
+            st.markdown("**上市｜TWSE**")
+            st.dataframe(view, use_container_width=True, hide_index=True)
+        else:
+            st.warning("目前無法直接取得 TWSE 除權息預告資料，請使用官方查詢。")
+
+        tpex_ex = load_tpex_exrights_html()
+        st.markdown("**上櫃｜TPEx**")
+        if not tpex_ex.empty:
+            st.dataframe(tpex_ex, use_container_width=True, hide_index=True)
+        else:
+            st.info("TPEx 官方除權息頁面可能限制自動抓取，因此這裡提供官方查詢入口。")
+        st.link_button("🔗 開啟 TWSE 官方除權除息預告表", "https://www.twse.com.tw/exchangeReport/TWT48U?response=html", use_container_width=True)
+        st.link_button("🔗 開啟 TPEx 官方除權除息公告", "https://www.tpex.org.tw/zh-tw/announce/market/ex/announce.html", use_container_width=True)
+
+
+def render_futures_diary():
+    st.title("📖 海期日記")
+    st.caption("這裡會是傑森自己的海期操盤日記。")
+    st.markdown(
+        """
+        <div class="page-card">
+          <h3 style="margin-top:0;color:#7A3E00;">📝 操盤日記</h3>
+          <p>之後可以在這裡發表你的海期交易紀錄，例如：</p>
+          <ul>
+            <li>交易日期與商品（NQ／MNQ 等）</li>
+            <li>進場理由、出場理由</li>
+            <li>當時使用的 SURF／均線／背離訊號</li>
+            <li>停損、停利與實際結果</li>
+            <li>當天盤後檢討與下一次改善事項</li>
+          </ul>
+          <p style="margin-bottom:0;color:#8A6A52;">目前先建立頁面；之後可以再加上「新增日記、編輯、日期搜尋、標籤、圖片」以及永久儲存功能。</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.warning("📌 目前這一頁先作為日記入口；尚未啟用永久儲存，所以不要把正式日記只存放在這個測試頁面。")
+
+
+# =========================
+# 導覽頁面分流
+# =========================
+if page == "events":
+    render_events_page()
+    st.divider()
+    st.caption("資料來源：TWSE／TPEx 官方網站與公開資料。")
+    st.stop()
+
+if page == "futures":
+    render_futures_diary()
+    st.divider()
+    st.caption("飆股獵奇-傑森｜海期日記預備頁")
+    st.stop()
+
+# =========================
 # Streamlit UI
 # =========================
 st.title("🚀 飆股選股器 V2.0")
@@ -1032,7 +1545,7 @@ if not detail_mode:
     def make_stock_link(row):
         code = str(row["代號"])
         name = str(row["名稱"])
-        return f'<a href="?stock={code}" target="_self" style="text-decoration:none; font-weight:600; color:#1769aa;">{name}</a>'
+        return f'<a href="?page=home&stock={code}" target="_self" style="text-decoration:none; font-weight:600; color:#9A4D00;">{name}</a>'
 
     html_cols = ["排名","代號","名稱","股價","市場","營收年月","月營收YoY","累計營收YoY","EPS","PE","週MA12斜率","週趨勢","V2基本總分","型態分","V2總分"]
     html = [
@@ -1248,9 +1761,11 @@ if detail_mode:
                     .copy()
                 )
 
-                recent_w.index = recent_w.index.strftime(
-                    "%Y-%m-%d"
-                )
+                # 雲端環境的 Yahoo 資料索引有時會不是標準 DatetimeIndex，
+                # 先強制轉換，避免週K圖畫完後在表格這一步中斷，導致下面月K全部消失。
+                recent_w.index = pd.to_datetime(recent_w.index, errors="coerce")
+                recent_w = recent_w[recent_w.index.notna()]
+                recent_w.index = recent_w.index.strftime("%Y-%m-%d")
 
                 recent_w = recent_w[
                     [
@@ -1292,9 +1807,10 @@ if detail_mode:
                     .copy()
                 )
 
-                recent_m.index = recent_m.index.strftime(
-                    "%Y-%m"
-                )
+                # 同樣保護月K資料索引，避免雲端資料格式差異造成後續畫面中斷。
+                recent_m.index = pd.to_datetime(recent_m.index, errors="coerce")
+                recent_m = recent_m[recent_m.index.notna()]
+                recent_m.index = recent_m.index.strftime("%Y-%m")
 
                 recent_m = recent_m[
                     [
