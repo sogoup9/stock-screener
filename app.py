@@ -79,6 +79,10 @@ st.markdown(
         color: #B9855A;
         font-weight: 700;
     }
+    /* 讓上方設定區在捲動頁面時保持可見 */
+    div[data-testid="stVerticalBlock"]:has(> div[data-testid="stMarkdownContainer"] h3) {
+        scroll-margin-top: 12px;
+    }
     .page-card {
         background: #FFFFFF;
         border: 1px solid #F1D9C1;
@@ -198,6 +202,7 @@ def load_universe():
                 pick(row, ["公司代號", "股票代號", "Code"])
             )
             name = pick(row, ["公司名稱", "名稱", "Name"])
+            industry = pick(row, ["產業別", "產業類別", "Industry"])
 
             if code:
                 rows.append(
@@ -205,11 +210,12 @@ def load_universe():
                         "代號": code,
                         "名稱": str(name or "").strip(),
                         "市場": market,
+                        "產業": str(industry or "").strip(),
                     }
                 )
 
     if not rows:
-        return pd.DataFrame(columns=["代號", "名稱", "市場"])
+        return pd.DataFrame(columns=["代號", "名稱", "市場", "產業"])
 
     result = pd.DataFrame(rows)
     result = result[result["代號"].str.fullmatch(r"[1-9]\d{3}", na=False)]
@@ -256,6 +262,16 @@ def load_revenue():
                             ],
                         )
                     ),
+                    "營收MoM": to_num(
+                        pick(
+                            row,
+                            [
+                                "營業收入-上月比較增減(%)",
+                                "營業收入-上月比較增減(％)",
+                                "上月比較增減(%)",
+                            ],
+                        )
+                    ),
                     "累計營收YoY": to_num(
                         pick(
                             row,
@@ -286,6 +302,7 @@ def load_revenue():
                 "市場",
                 "營收年月",
                 "月營收YoY",
+                "營收MoM",
                 "累計營收YoY",
                 "當月營收",
             ]
@@ -1391,7 +1408,7 @@ if page == "futures":
 st.title("🚀 飆股選股器 V2.0")
 render_adsense("2164666279", height=135)
 st.caption(
-    "上市＋上櫃｜月營收＋累計營收＋EPS＋PE＋週MA12斜率｜目前 70 分基礎模型"
+    "上市＋上櫃｜產業＋營收YoY＋營收MoM＋累計營收YoY＋EPS＋PE＋週MA12斜率｜營收動能優先"
 )
 
 with st.sidebar:
@@ -1406,8 +1423,9 @@ with st.sidebar:
     sort_field = st.selectbox(
         "排序方式",
         [
+            "營收YoY",
             "V2總分",
-            "月營收YoY",
+            "營收MoM",
             "累計營收YoY",
             "週MA12斜率",
             "EPS",
@@ -1448,17 +1466,12 @@ if run or "scan_result" not in st.session_state:
         how="left",
     )
 
-    # 先用營收/EPS 做技術資料抓取前的預篩，
-    # 避免一次對全市場大量呼叫 Yahoo。
-    base["初步分"] = (
-        base["月營收YoY"].fillna(-999) * 0.4
-        + base["累計營收YoY"].fillna(-999) * 0.2
-        + base["EPS"].fillna(-999)
-    )
-
+    # 預設以「營收YoY → 營收MoM → 累計營收YoY」作為多層排序，
+    # 讓前 100／300 檔本身就符合使用者指定的營收優先順序。
     base = base.sort_values(
-        "初步分",
-        ascending=False,
+        ["月營收YoY", "營收MoM", "累計營收YoY"],
+        ascending=[False, False, False],
+        na_position="last",
     )
 
     if scan_size == "100 檔測試":
@@ -1496,11 +1509,21 @@ if run or "scan_result" not in st.session_state:
 result = st.session_state["scan_result"].copy()
 
 ascending = not high_to_low
-result = result.sort_values(
-    sort_field,
-    ascending=ascending,
-    na_position="last",
-).reset_index(drop=True)
+if sort_field == "營收YoY":
+    # 預設／主排序：營收YoY → 營收MoM → 累計營收YoY
+    result = result.sort_values(
+        ["月營收YoY", "營收MoM", "累計營收YoY"],
+        ascending=[ascending, ascending, ascending],
+        na_position="last",
+    )
+else:
+    sort_col = "月營收YoY" if sort_field == "營收YoY" else sort_field
+    result = result.sort_values(
+        sort_col,
+        ascending=ascending,
+        na_position="last",
+    )
+result = result.reset_index(drop=True)
 
 result.insert(
     0,
@@ -1537,8 +1560,8 @@ if not detail_mode:
 # =========================
 if not detail_mode:
     st.subheader("📊 飆股候選排名")
-    show = result[["排名","代號","名稱","股價","市場","營收年月","月營收YoY","累計營收YoY","EPS","PE","週MA12斜率","週趨勢","V2基本總分","型態分","V2總分"]].copy()
-    for col in ["月營收YoY","累計營收YoY","EPS","PE","週MA12斜率"]:
+    show = result[["排名","代號","名稱","產業","股價","市場","營收年月","月營收YoY","營收MoM","累計營收YoY","EPS","PE","週MA12斜率","週趨勢","V2基本總分","型態分","V2總分"]].copy()
+    for col in ["月營收YoY","營收MoM","累計營收YoY","EPS","PE","週MA12斜率"]:
         show[col] = show[col].round(2)
 
     # 股名本身就是連結：直接點股名進入個股詳細頁。
@@ -1547,7 +1570,7 @@ if not detail_mode:
         name = str(row["名稱"])
         return f'<a href="?page=home&stock={code}" target="_self" style="text-decoration:none; font-weight:600; color:#9A4D00;">{name}</a>'
 
-    html_cols = ["排名","代號","名稱","股價","市場","營收年月","月營收YoY","累計營收YoY","EPS","PE","週MA12斜率","週趨勢","V2基本總分","型態分","V2總分"]
+    html_cols = ["排名","代號","名稱","產業","股價","市場","營收年月","月營收YoY","營收MoM","累計營收YoY","EPS","PE","週MA12斜率","週趨勢","V2基本總分","型態分","V2總分"]
     html = [
         '<div style="overflow-x:auto; border:1px solid #e6e8eb; border-radius:12px; background:#fff;">',
         '<table style="width:100%; border-collapse:collapse; font-size:14px; white-space:nowrap;">',
@@ -1561,7 +1584,7 @@ if not detail_mode:
         for col in html_cols:
             if col == "名稱":
                 val = make_stock_link(r)
-            elif col in ["月營收YoY", "累計營收YoY", "週MA12斜率"] and pd.notna(r[col]):
+            elif col in ["月營收YoY", "營收MoM", "累計營收YoY", "週MA12斜率"] and pd.notna(r[col]):
                 val = f'{r[col]:.2f}%'
             elif col in ["股價", "EPS", "PE"] and pd.notna(r[col]):
                 val = f'{r[col]:.2f}'
