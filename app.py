@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
@@ -79,10 +78,17 @@ st.markdown(
         color: #B9855A;
         font-weight: 700;
     }
-    /* 讓上方設定區在捲動頁面時保持可見 */
-    div[data-testid="stVerticalBlock"]:has(> div[data-testid="stMarkdownContainer"] h3) {
-        scroll-margin-top: 12px;
+    /* 左側設定欄縮窄，讓主畫面有更多空間 */
+    section[data-testid="stSidebar"] {
+        width: 225px !important;
+        min-width: 225px !important;
     }
+    section[data-testid="stSidebar"] > div {
+        width: 225px !important;
+    }
+    .num-positive { color: #d62728 !important; font-weight: 700; }
+    .num-negative { color: #159447 !important; font-weight: 700; }
+
     .page-card {
         background: #FFFFFF;
         border: 1px solid #F1D9C1;
@@ -125,6 +131,9 @@ st.markdown(
 # =========================
 TWSE = "https://openapi.twse.com.tw/v1"
 TPEX = "https://www.tpex.org.tw/openapi/v1"
+MOPS = "https://mopsov.twse.com.tw"
+TWSE_STOCK_DAY = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+TPEX_TRADING_STOCK = "https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock"
 
 URL = {
     "listed_company": f"{TWSE}/opendata/t187ap03_L",
@@ -441,26 +450,14 @@ def load_pe():
 # =========================
 # 個股歷史基本面：月營收／季EPS／季本益比
 # =========================
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+MOPS_OPEN = "https://mopsfin.twse.com.tw/opendata"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def finmind_dataset(dataset, code, start_date="2020-01-01"):
+def fetch_mops_csv(url):
     try:
-        r = requests.get(
-            FINMIND_URL,
-            params={
-                "dataset": dataset,
-                "data_id": str(code),
-                "start_date": start_date,
-            },
-            timeout=30,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
+        r=requests.get(url,timeout=30,headers={"User-Agent":"Mozilla/5.0"})
         r.raise_for_status()
-        obj = r.json()
-        data = obj.get("data", []) if isinstance(obj, dict) else []
-        return pd.DataFrame(data)
+        return pd.read_csv(StringIO(r.content.decode("utf-8-sig",errors="ignore")))
     except Exception:
         return pd.DataFrame()
 
@@ -470,139 +467,220 @@ def quarter_label(dt):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_detail_fundamentals(code):
-    """
-    個股詳細頁最重要的基本面：
-    1. 每月營收 + 月營收年增率
-    2. 每季彙總營收 + 季營收年增率
-    3. 每季單季 EPS
-    4. 每季本益比：取該季最後一個有資料交易日的 PER
-    最新季度在最上面。
-    """
-    revenue = finmind_dataset(
-        "TaiwanStockMonthRevenue", code, "2020-01-01"
-    )
-    eps = finmind_dataset(
-        "TaiwanStockFinancialStatements", code, "2020-01-01"
-    )
-    per = finmind_dataset(
-        "TaiwanStockPER", code, "2020-01-01"
-    )
+def mops_monthly_report(market, year, month):
+    """MOPS 歷史月營收靜態 CSV；sii=上市、otc=上櫃。"""
+    roc_year=year-1911
+    market_code="sii" if market=="上市" else "otc"
+    url=f"{MOPS}/nas/t21/{market_code}/t21sc03_{roc_year}_{month}.csv"
+    try:
+        r=requests.get(url,timeout=30,headers={"User-Agent":"Mozilla/5.0"})
+        r.raise_for_status()
+        return pd.read_csv(StringIO(r.content.decode("utf-8-sig",errors="ignore")))
+    except Exception:
+        return pd.DataFrame()
 
-    # ---- 月營收 ----
-    if revenue.empty:
-        rev = pd.DataFrame()
-    else:
-        rev = revenue.copy()
-        rev["date"] = pd.to_datetime(rev.get("date"), errors="coerce")
-        rev["revenue"] = pd.to_numeric(rev.get("revenue"), errors="coerce")
-        rev["revenue_year"] = pd.to_numeric(rev.get("revenue_year"), errors="coerce")
-        rev["revenue_month"] = pd.to_numeric(rev.get("revenue_month"), errors="coerce")
-        rev = rev.dropna(subset=["date", "revenue"])
-        rev = rev.sort_values("date")
-        # 同一月份若有重複資料，保留最後一筆。
-        if "revenue_year" in rev.columns and "revenue_month" in rev.columns:
-            rev = rev.drop_duplicates(["revenue_year", "revenue_month"], keep="last")
-        rev["YoY%"] = (
-            rev["revenue"].pct_change(12) * 100
-        )
-        # 優先使用資料年月重新排序，避免公告日與營收月份不同造成錯位。
-        rev["年月"] = rev["revenue_year"].astype("Int64").astype(str) + "-" + rev["revenue_month"].astype("Int64").astype(str).str.zfill(2)
-        rev["季度"] = rev["date"].apply(lambda x: quarter_label(x))
 
-    # ---- 季 EPS ----
-    if eps.empty:
-        eps_q = pd.DataFrame()
-    else:
-        e = eps.copy()
-        e["date"] = pd.to_datetime(e.get("date"), errors="coerce")
-        e["value"] = pd.to_numeric(e.get("value"), errors="coerce")
-        e = e[e.get("type", pd.Series(index=e.index)).astype(str).eq("EPS")]
-        e = e.dropna(subset=["date", "value"]).sort_values("date")
-        e["季度"] = e["date"].apply(lambda x: quarter_label(x))
-        e = e.drop_duplicates("季度", keep="last")
-        eps_q = e[["季度", "date", "value"]].rename(columns={"value": "季EPS"})
+@st.cache_data(ttl=3600, show_spinner=False)
+def mops_stock_monthly_history(code, market, months=36):
+    end=pd.Timestamp(datetime.now().date()).replace(day=1)
+    frames=[]
+    for i in range(months-1,-1,-1):
+        d=end-pd.DateOffset(months=i)
+        df=mops_monthly_report(market,int(d.year),int(d.month))
+        if df.empty:
+            continue
+        code_col=next((c for c in ["公司代號","股票代號","證券代號"] if c in df.columns),None)
+        if not code_col:
+            continue
+        codes=df[code_col].astype(str).str.extract(r"(\d{4})",expand=False)
+        hit=df[codes.eq(str(code))].copy()
+        if not hit.empty:
+            hit["西元年月"]=f"{int(d.year):04d}-{int(d.month):02d}"
+            frames.append(hit)
+    return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
 
-    # ---- 季本益比 ----
-    if per.empty:
-        per_q = pd.DataFrame()
-    else:
-        pe = per.copy()
-        pe["date"] = pd.to_datetime(pe.get("date"), errors="coerce")
-        pe["PER"] = pd.to_numeric(pe.get("PER"), errors="coerce")
-        pe = pe.dropna(subset=["date"]).sort_values("date")
-        pe["季度"] = pe["date"].apply(lambda x: quarter_label(x))
-        # 一季取最後一個有 PE 的交易日，避免中間缺值。
-        pe_q = pe.dropna(subset=["PER"]).drop_duplicates("季度", keep="last")
-        per_q = pe_q[["季度", "date", "PER"]].rename(columns={"PER": "季PE"})
 
-    # ---- 合併：以最近 12 季為主，最新在上 ----
-    quarters = set()
-    if not rev.empty:
-        quarters.update(rev["季度"].dropna().tolist())
-    if not eps_q.empty:
-        quarters.update(eps_q["季度"].dropna().tolist())
-    if not per_q.empty:
-        quarters.update(per_q["季度"].dropna().tolist())
+@st.cache_data(ttl=3600, show_spinner=False)
+def mops_eps_history(code, market, quarters=12):
+    """MOPS 個股合併損益表的基本每股盈餘。"""
+    rows=[]
+    endpoint=f"{MOPS}/mops/web/ajax_t164sb04"
+    today=pd.Timestamp(datetime.now().date())
+    for offset in range(quarters):
+        qdate=today-pd.DateOffset(months=3*offset)
+        year=int(qdate.year)-1911
+        season=((int(qdate.month)-1)//3)+1
+        try:
+            payload={"encodeURIComponent":"1","step":"1","firstin":"1","off":"1","co_id":str(code),"year":str(year),"season":f"{season:02d}","TYPEK":"all","isnew":"false","queryName":"co_id"}
+            r=requests.post(endpoint,data=payload,timeout=30,headers={"User-Agent":"Mozilla/5.0"})
+            tables=pd.read_html(StringIO(r.text))
+            eps_val=np.nan
+            for t in tables:
+                for _,rr in t.iterrows():
+                    cells=[str(v).strip() for v in rr.tolist()]
+                    if not any("基本每股盈餘" in c for c in cells):
+                        continue
+                    nums=[]
+                    for v in cells:
+                        n=to_num(v)
+                        if pd.notna(n): nums.append(n)
+                    if nums:
+                        eps_val=nums[0]
+                        break
+                if pd.notna(eps_val): break
+            rows.append({"季度":f"{qdate.year} Q{season}","季EPS":eps_val})
+        except Exception:
+            continue
+        time.sleep(0.12)
+    return pd.DataFrame(rows).drop_duplicates("季度") if rows else pd.DataFrame()
 
-    if not quarters:
-        return pd.DataFrame(), pd.DataFrame()
 
-    qdf = pd.DataFrame({"季度": list(quarters)})
-    qdf["排序"] = qdf["季度"].str.extract(r"(\d{4}) Q(\d)")[0].astype(int) * 10 + qdf["季度"].str.extract(r"(\d{4}) Q(\d)")[1].astype(int)
-
-    # 每季三個月份欄位：營收與月YoY。
-    if not rev.empty:
-        rev2 = rev.copy()
-        rev2["年份"] = pd.to_numeric(rev2["revenue_year"], errors="coerce")
-        rev2["月份"] = pd.to_numeric(rev2["revenue_month"], errors="coerce")
-        rev2["季排序"] = rev2["年份"] * 10 + ((rev2["月份"] - 1) // 3 + 1)
-        for m in [1, 2, 3]:
-            # m 是季度內第幾個月，不是月份數字。
-            pass
-        rows = []
-        for qsort, g in rev2.groupby("季排序"):
-            if pd.isna(qsort):
-                continue
-            year = int(qsort // 10)
-            qnum = int(qsort % 10)
-            row = {"季度": f"{year} Q{qnum}", "季度營收": g["revenue"].sum()}
-            prev = rev2[rev2["季排序"] == qsort - 10]
-            prev_sum = prev["revenue"].sum() if not prev.empty else np.nan
-            row["季度營收YoY"] = ((row["季度營收"] / prev_sum) - 1) * 100 if pd.notna(prev_sum) and prev_sum != 0 else np.nan
-            for month_num in range((qnum - 1) * 3 + 1, qnum * 3 + 1):
-                mg = g[g["月份"] == month_num]
-                if not mg.empty:
-                    rr = mg.iloc[-1]
-                    row[f"{month_num}月營收"] = rr["revenue"]
-                    row[f"{month_num}月YoY"] = rr["YoY%"]
-            rows.append(row)
-        qrev = pd.DataFrame(rows)
-        qdf = qdf.merge(qrev, on="季度", how="left")
-
-    if not eps_q.empty:
-        qdf = qdf.merge(eps_q[["季度", "季EPS"]], on="季度", how="left")
-    if not per_q.empty:
-        qdf = qdf.merge(per_q[["季度", "季PE"]], on="季度", how="left")
-
-    qdf = qdf.sort_values("排序", ascending=False).head(12).drop(columns=["排序"])
-
-    # 再給個股頁一張「月營收明細」：最新到舊，方便核對每個月數字。
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_detail_fundamentals(code, market="上市"):
+    rev=mops_stock_monthly_history(code,market,36)
+    eps_q=mops_eps_history(code,market,12)
     if rev.empty:
-        monthly_detail = pd.DataFrame()
-    else:
-        monthly_detail = rev.sort_values("date", ascending=False).head(36).copy()
-        monthly_detail["營收(千元)"] = monthly_detail["revenue"]
-        monthly_detail = monthly_detail[["年月", "營收(千元)", "YoY%", "季度"]]
-
-    return qdf, monthly_detail
+        return pd.DataFrame(),pd.DataFrame()
+    revenue_col=next((c for c in ["營業收入-當月營收","當月營收","當月營業收入"] if c in rev.columns),None)
+    yoy_col=next((c for c in ["營業收入-去年同月增減(%)","營業收入-去年同月增減(％)","去年同月增減(%)"] if c in rev.columns),None)
+    if not revenue_col:
+        return pd.DataFrame(),pd.DataFrame()
+    rev["revenue"]=pd.to_numeric(rev[revenue_col],errors="coerce")
+    rev["YoY%"]=pd.to_numeric(rev[yoy_col],errors="coerce") if yoy_col else np.nan
+    rev["date"]=pd.to_datetime(rev["西元年月"]+"-01",errors="coerce")
+    rev=rev.dropna(subset=["date","revenue"]).sort_values("date")
+    rev["季度"]=rev["date"].apply(quarter_label)
+    rows=[]
+    for q,g in rev.groupby("季度"):
+        qnum=int(q[-1]); year=int(q[:4])
+        row={"季度":q,"季度營收":g["revenue"].sum()}
+        prev=rev[rev["季度"].eq(f"{year-1} Q{qnum}")]["revenue"]
+        prev_sum=prev.sum() if not prev.empty else np.nan
+        row["季度營收YoY"]=((row["季度營收"]/prev_sum)-1)*100 if pd.notna(prev_sum) and prev_sum!=0 else np.nan
+        for month_no in range((qnum-1)*3+1,qnum*3+1):
+            mg=g[g["date"].dt.month.eq(month_no)]
+            if not mg.empty:
+                rr=mg.iloc[-1]
+                row[f"{month_no}月營收"]=rr["revenue"]
+                row[f"{month_no}月YoY"]=rr["YoY%"]
+        rows.append(row)
+    qdf=pd.DataFrame(rows)
+    if not eps_q.empty: qdf=qdf.merge(eps_q,on="季度",how="left")
+    qdf=qdf.sort_values("季度",ascending=False).head(12)
+    monthly_detail=rev.sort_values("date",ascending=False).head(36).copy()
+    monthly_detail["年月"]=monthly_detail["date"].dt.strftime("%Y-%m")
+    monthly_detail["營收(千元)"]=monthly_detail["revenue"]
+    monthly_detail=monthly_detail[["年月","營收(千元)","YoY%","季度"]]
+    return qdf,monthly_detail
 
 
 # =========================
-# Yahoo Finance 技術資料
+# 官方歷史行情：TWSE / TPEx
 # =========================
-def yahoo_symbol(code, market):
-    return f"{code}.TW" if market == "上市" else f"{code}.TWO"
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_official_month(code, market, month_start):
+    """抓單一股票單一月份官方日K；完全移除 Yahoo Finance。"""
+    try:
+        if market == "上市":
+            r = requests.get(
+                TWSE_STOCK_DAY,
+                params={
+                    "response": "json",
+                    "date": month_start.strftime("%Y%m%d"),
+                    "stockNo": str(code),
+                },
+                timeout=30,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            payload = r.json()
+            if payload.get("stat") != "OK":
+                return pd.DataFrame()
+            rows = []
+            for item in payload.get("data", []):
+                if len(item) < 9:
+                    continue
+                rows.append({
+                    "DateText": item[0],
+                    "Volume": to_num(item[1]),
+                    "Turnover": to_num(item[2]),
+                    "Open": to_num(item[3]),
+                    "High": to_num(item[4]),
+                    "Low": to_num(item[5]),
+                    "Close": to_num(item[6]),
+                })
+            if not rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(rows)
+            def roc_date(v):
+                m = re.search(r"(\d{3})/(\d{1,2})/(\d{1,2})", str(v))
+                if not m:
+                    return pd.NaT
+                return pd.Timestamp(int(m.group(1))+1911, int(m.group(2)), int(m.group(3)))
+            df.index = pd.to_datetime(df["DateText"].map(roc_date), errors="coerce")
+            return df.drop(columns=["DateText"]).loc[lambda x: x.index.notna()]
+
+        # TPEx 官方個股月資料：POST 回傳 JSON。成交量原始單位為張。
+        r = requests.post(
+            TPEX_TRADING_STOCK,
+            data={
+                "response": "json",
+                "code": str(code),
+                "date": month_start.strftime("%Y/%m/%d"),
+            },
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        payload = r.json()
+        if str(payload.get("stat", "")).lower() != "ok":
+            return pd.DataFrame()
+        tables = payload.get("tables") or []
+        if not tables:
+            return pd.DataFrame()
+        rows = []
+        for item in tables[0].get("data", []):
+            if len(item) < 7:
+                continue
+            rows.append({
+                "DateText": item[0],
+                "Volume": to_num(item[1]) * 1000,
+                "Turnover": to_num(item[2]) * 1000,
+                "Open": to_num(item[3]),
+                "High": to_num(item[4]),
+                "Low": to_num(item[5]),
+                "Close": to_num(item[6]),
+            })
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        def roc_date(v):
+            m = re.search(r"(\d{3})/(\d{1,2})/(\d{1,2})", str(v))
+            if not m:
+                return pd.NaT
+            return pd.Timestamp(int(m.group(1))+1911, int(m.group(2)), int(m.group(3)))
+        df.index = pd.to_datetime(df["DateText"].map(roc_date), errors="coerce")
+        return df.drop(columns=["DateText"]).loc[lambda x: x.index.notna()]
+    except Exception:
+        return pd.DataFrame()
+
+
+def month_starts_back(months=8):
+    today = pd.Timestamp(datetime.now().date()).replace(day=1)
+    return [today - pd.DateOffset(months=i) for i in range(months-1, -1, -1)]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_daily(code, market, months=26):
+    frames = []
+    for m in month_starts_back(months):
+        df = load_official_month(code, market, pd.Timestamp(m).to_pydatetime())
+        if not df.empty:
+            frames.append(df)
+        time.sleep(0.12)
+    if not frames:
+        return pd.DataFrame()
+    x = pd.concat(frames).sort_index()
+    x = x[~x.index.duplicated(keep="last")]
+    return x.dropna(subset=["Close"])
 
 
 def make_weekly(df):
@@ -636,67 +714,25 @@ def make_weekly(df):
     return w
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_weekly_technical(items):
     if not items:
         return pd.DataFrame()
-
-    symbols = [yahoo_symbol(c, m) for c, m in items]
-
-    try:
-        raw = yf.download(
-            symbols,
-            period="2y",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=True,
-            group_by="ticker",
-        )
-    except Exception:
-        return pd.DataFrame()
-
     rows = []
-
     for code, market in items:
-        symbol = yahoo_symbol(code, market)
-
         try:
-            if len(symbols) == 1:
-                d = raw.copy()
-            else:
-                if not isinstance(raw.columns, pd.MultiIndex):
-                    continue
-                if symbol not in raw.columns.get_level_values(0):
-                    continue
-                d = raw[symbol].copy()
-
+            # 7 個月約 30 週，足夠計算週 MA24 與 MA12 斜率。
+            d = load_daily(code, market, months=8)
             w = make_weekly(d)
-
             if len(w) < 25:
                 continue
-
             last = w.iloc[-1]
             prev = w.iloc[-2]
-
             ma12 = last["MA12"]
             prev_ma12 = prev["MA12"]
             ma24 = last["MA24"]
             close = last["Close"]
-
-            if (
-                pd.notna(ma12)
-                and pd.notna(prev_ma12)
-                and prev_ma12 != 0
-            ):
-                slope = (
-                    (ma12 - prev_ma12)
-                    / prev_ma12
-                    * 100
-                )
-            else:
-                slope = np.nan
-
+            slope = ((ma12-prev_ma12)/prev_ma12*100) if pd.notna(ma12) and pd.notna(prev_ma12) and prev_ma12 != 0 else np.nan
             if close > ma12 > ma24:
                 trend = "強勢多頭"
             elif ma12 > ma24:
@@ -705,26 +741,16 @@ def load_weekly_technical(items):
                 trend = "整理"
             else:
                 trend = "偏弱"
-
-            rows.append(
-                {
-                    "代號": code,
-                    "市場": market,
-                    "股價": float(close),
-                    "週MA12": float(ma12),
-                    "週MA24": float(ma24),
-                    "週MA12斜率": float(slope)
-                    if pd.notna(slope)
-                    else np.nan,
-                    "週趨勢": trend,
-                    "技術日期": w.index[-1].strftime(
-                        "%Y-%m-%d"
-                    ),
-                }
-            )
+            rows.append({
+                "代號": code, "市場": market, "股價": float(close),
+                "週MA12": float(ma12) if pd.notna(ma12) else np.nan,
+                "週MA24": float(ma24) if pd.notna(ma24) else np.nan,
+                "週MA12斜率": float(slope) if pd.notna(slope) else np.nan,
+                "週趨勢": trend,
+                "技術日期": w.index[-1].strftime("%Y-%m-%d"),
+            })
         except Exception:
             continue
-
     return pd.DataFrame(rows)
 
 
@@ -838,30 +864,6 @@ def add_scores(df):
 # =========================
 # 個股詳細 K 線
 # =========================
-@st.cache_data(ttl=900, show_spinner=False)
-def load_daily(code, market):
-    try:
-        df = yf.download(
-            yahoo_symbol(code, market),
-            period="3y",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        return (
-            df.dropna(subset=["Close"])
-            if not df.empty
-            else df
-        )
-    except Exception:
-        return pd.DataFrame()
-
-
 def make_monthly(df):
     if df.empty:
         return pd.DataFrame()
@@ -1169,7 +1171,7 @@ def render_disposition_detail(code, market, event_name="", end_date=pd.NaT):
 
     daily = load_daily(code, market)
     if daily.empty:
-        st.error("目前抓不到這檔股票的 Yahoo Finance 日線資料，請稍後再試。")
+        st.error("目前抓不到這檔股票的官方歷史日K資料，請稍後再試。")
         return
 
     daily = daily.copy()
@@ -1301,7 +1303,7 @@ def render_events_page():
         return
 
     st.title("📅 近期事件")
-    st.caption("處置／除權息｜資料優先採用 TWSE、TPEx 官方資料；更新時間依官方公告。")
+    st.caption("處置／除權息｜基本面／公告資料以 MOPS 為主；行情資料採 TWSE／TPEx 官方歷史行情。")
 
     today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st.caption(f"本頁資料查詢時間：{today}")
@@ -1408,7 +1410,7 @@ if page == "futures":
 st.title("🚀 飆股選股器 V2.0")
 render_adsense("2164666279", height=135)
 st.caption(
-    "上市＋上櫃｜產業＋營收YoY＋營收MoM＋累計營收YoY＋EPS＋PE＋週MA12斜率｜營收動能優先"
+    "上市＋上櫃｜月營收＋累計營收＋EPS＋PE＋週MA12斜率｜目前 70 分基礎模型"
 )
 
 with st.sidebar:
@@ -1423,8 +1425,8 @@ with st.sidebar:
     sort_field = st.selectbox(
         "排序方式",
         [
-            "營收YoY",
             "V2總分",
+            "營收YoY",
             "營收MoM",
             "累計營收YoY",
             "週MA12斜率",
@@ -1466,8 +1468,7 @@ if run or "scan_result" not in st.session_state:
         how="left",
     )
 
-    # 預設以「營收YoY → 營收MoM → 累計營收YoY」作為多層排序，
-    # 讓前 100／300 檔本身就符合使用者指定的營收優先順序。
+    # 技術資料抓取前，先依使用者指定的營收優先順序預篩。
     base = base.sort_values(
         ["月營收YoY", "營收MoM", "累計營收YoY"],
         ascending=[False, False, False],
@@ -1489,7 +1490,7 @@ if run or "scan_result" not in st.session_state:
     )
 
     with st.spinner(
-        f"② 正在抓取 {len(items)} 檔週K並計算週MA12斜率…"
+        f"② 正在抓取 {len(items)} 檔官方週K並計算週MA12斜率…"
     ):
         technical = load_weekly_technical(items)
 
@@ -1510,7 +1511,6 @@ result = st.session_state["scan_result"].copy()
 
 ascending = not high_to_low
 if sort_field == "營收YoY":
-    # 預設／主排序：營收YoY → 營收MoM → 累計營收YoY
     result = result.sort_values(
         ["月營收YoY", "營收MoM", "累計營收YoY"],
         ascending=[ascending, ascending, ascending],
@@ -1551,7 +1551,7 @@ if not detail_mode:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("股票數", f"{len(result):,}")
     c2.metric("最高分", f"{result['V2總分'].max():.0f}" if len(result) else "-")
-    c3.metric("月營收 ≥100%", f"{int((result['月營收YoY'] >= 100).sum())}")
+    c3.metric("營收YoY ≥100%", f"{int((result['月營收YoY'] >= 100).sum())}")
     c4.metric("週MA12上彎", f"{int((result['週MA12斜率'] >= 0).sum())}")
     st.caption(f"最後掃描：{st.session_state.get('scan_time', '-')}")
 
@@ -1560,6 +1560,7 @@ if not detail_mode:
 # =========================
 if not detail_mode:
     st.subheader("📊 飆股候選排名")
+    st.caption("營收YoY＝單月年增率｜營收MoM＝單月月增率｜累計營收YoY＝今年累計營收年增率")
     show = result[["排名","代號","名稱","產業","股價","市場","營收年月","月營收YoY","營收MoM","累計營收YoY","EPS","PE","週MA12斜率","週趨勢","V2基本總分","型態分","V2總分"]].copy()
     for col in ["月營收YoY","營收MoM","累計營收YoY","EPS","PE","週MA12斜率"]:
         show[col] = show[col].round(2)
@@ -1572,12 +1573,21 @@ if not detail_mode:
 
     html_cols = ["排名","代號","名稱","產業","股價","市場","營收年月","月營收YoY","營收MoM","累計營收YoY","EPS","PE","週MA12斜率","週趨勢","V2基本總分","型態分","V2總分"]
     html = [
-        '<div style="overflow-x:auto; border:1px solid #e6e8eb; border-radius:12px; background:#fff;">',
+        '<div translate="no" lang="zh-Hant" style="overflow-x:auto; border:1px solid #e6e8eb; border-radius:12px; background:#fff;">',
         '<table style="width:100%; border-collapse:collapse; font-size:14px; white-space:nowrap;">',
         '<thead><tr style="background:#f7f8fa;">'
     ]
+    header_names = {
+        "產業": "主要產業",
+        "營收年月": "營收年月",
+        "月營收YoY": "營收YoY（年增率）",
+        "營收MoM": "營收MoM（月增率）",
+        "累計營收YoY": "累計營收YoY（累計年增率）",
+        "PE": "本益比PE",
+    }
     for col in html_cols:
-        html.append(f'<th style="padding:10px 9px; border-bottom:1px solid #e6e8eb; text-align:left; font-weight:650;">{col}</th>')
+        header = header_names.get(col, col)
+        html.append(f'<th style="padding:10px 9px; border-bottom:1px solid #e6e8eb; text-align:left; font-weight:650;">{header}</th>')
     html.append('</tr></thead><tbody>')
     for _, r in show.iterrows():
         vals = []
@@ -1585,9 +1595,11 @@ if not detail_mode:
             if col == "名稱":
                 val = make_stock_link(r)
             elif col in ["月營收YoY", "營收MoM", "累計營收YoY", "週MA12斜率"] and pd.notna(r[col]):
-                val = f'{r[col]:.2f}%'
+                cls = "num-positive" if float(r[col]) > 0 else ("num-negative" if float(r[col]) < 0 else "")
+                val = f'<span class="{cls}">{r[col]:.2f}%</span>' if cls else f'{r[col]:.2f}%'
             elif col in ["股價", "EPS", "PE"] and pd.notna(r[col]):
-                val = f'{r[col]:.2f}'
+                cls = "num-positive" if float(r[col]) > 0 else ("num-negative" if float(r[col]) < 0 else "")
+                val = f'<span class="{cls}">{r[col]:.2f}</span>' if cls else f'{r[col]:.2f}'
             elif col in ["V2基本總分", "型態分", "V2總分"] and pd.notna(r[col]):
                 val = f'{r[col]:.0f}'
             else:
@@ -1655,10 +1667,13 @@ if detail_mode:
             f"{row['V2總分']:.0f}/100",
         )
         c.metric(
-            "月營收YoY",
+            "營收YoY（單月年增率）",
             f"{row['月營收YoY']:.2f}%"
             if pd.notna(row["月營收YoY"])
             else "-",
+        )
+        st.caption(
+            f"營收MoM：{row['營收MoM']:.2f}%" if pd.notna(row["營收MoM"]) else "營收MoM：-"
         )
         d.metric(
             "累計營收YoY",
@@ -1684,7 +1699,7 @@ if detail_mode:
         st.caption("每季列出該季 3 個月營收、各月年增率、季度營收年增率、單季 EPS 與該季末本益比。")
 
         with st.spinner("正在抓取歷史月營收、季度 EPS 與歷史本益比…"):
-            quarterly_detail, monthly_detail = load_detail_fundamentals(code_value)
+            quarterly_detail, monthly_detail = load_detail_fundamentals(code_value, market_value)
 
         if quarterly_detail.empty:
             st.warning("目前抓不到這檔股票的歷史基本面資料，請稍後再試。")
@@ -1755,7 +1770,7 @@ if detail_mode:
 
         if daily.empty:
             st.warning(
-                "這檔股票目前抓不到 Yahoo Finance 歷史 K 線。"
+                "這檔股票目前抓不到官方歷史 K 線。"
             )
         else:
 
@@ -1784,7 +1799,7 @@ if detail_mode:
                     .copy()
                 )
 
-                # 雲端環境的 Yahoo 資料索引有時會不是標準 DatetimeIndex，
+                # 雲端環境的官方資料索引有時會不是標準 DatetimeIndex，
                 # 先強制轉換，避免週K圖畫完後在表格這一步中斷，導致下面月K全部消失。
                 recent_w.index = pd.to_datetime(recent_w.index, errors="coerce")
                 recent_w = recent_w[recent_w.index.notna()]
@@ -1864,6 +1879,6 @@ render_adsense("4790829615", height=125)
 st.divider()
 
 st.caption(
-    "資料來源：TWSE / TPEX 官方 OpenAPI、Yahoo Finance。"
-    " V2.0 目前為測試版；V2.1 再加入 30 分突破回測型態。"
+    "資料來源：公開資訊觀測站（MOPS）＋TWSE／TPEx 官方交易資料。"
+    " 基本面／事件以 MOPS 為主，K 線使用交易所官方歷史行情；已移除 Yahoo Finance 依賴。"
 )
