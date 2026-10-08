@@ -1418,7 +1418,7 @@ with st.sidebar:
 
     scan_size = st.selectbox(
         "掃描數量",
-        ["100 檔測試", "300 檔測試", "全市場"],
+        ["20 檔快速掃描", "100 檔測試", "300 檔測試", "全市場"],
         index=0,
     )
 
@@ -1475,7 +1475,9 @@ if run or "scan_result" not in st.session_state:
         na_position="last",
     )
 
-    if scan_size == "100 檔測試":
+    if scan_size == "20 檔快速掃描":
+        selected = base.head(20)
+    elif scan_size == "100 檔測試":
         selected = base.head(100)
     elif scan_size == "300 檔測試":
         selected = base.head(300)
