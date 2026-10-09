@@ -120,7 +120,7 @@ st.markdown(
       <span class="nav-sep">›</span>
       <a class="nav-item" href="?page=events" target="_self">近期事件（處置／除權息）</a>
       <span class="nav-sep">›</span>
-      <a class="nav-item" href="?page=futures" target="_self">海期日記</a>
+      <a class="nav-item" href="?page=futures" target="_self">操盤心得</a>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1397,7 +1397,7 @@ def render_events_page():
 
 
 def render_futures_diary():
-    st.title("📖 海期日記")
+    st.title("📖 操盤心得")
     st.caption("這裡會是傑森自己的海期操盤日記。")
     st.markdown(
         """
@@ -1431,7 +1431,7 @@ if page == "events":
 if page == "futures":
     render_futures_diary()
     st.divider()
-    st.caption("飆股獵奇-傑森｜海期日記預備頁")
+    st.caption("飆股獵奇-傑森｜操盤心得預備頁")
     st.stop()
 
 # =========================
