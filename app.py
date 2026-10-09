@@ -120,7 +120,7 @@ st.markdown(
       <span class="nav-sep">›</span>
       <a class="nav-item" href="?page=events" target="_self">近期事件（處置／除權息）</a>
       <span class="nav-sep">›</span>
-      <a class="nav-item" href="?page=futures" target="_self">操盤心得</a>
+      <a class="nav-item" href="?page=futures" target="_self">海期日記</a>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1397,7 +1397,7 @@ def render_events_page():
 
 
 def render_futures_diary():
-    st.title("📖 操盤心得")
+    st.title("📖 海期日記")
     st.caption("這裡會是傑森自己的海期操盤日記。")
     st.markdown(
         """
@@ -1431,7 +1431,7 @@ if page == "events":
 if page == "futures":
     render_futures_diary()
     st.divider()
-    st.caption("飆股獵奇-傑森｜操盤心得預備頁")
+    st.caption("飆股獵奇-傑森｜海期日記預備頁")
     st.stop()
 
 # =========================
@@ -1650,259 +1650,110 @@ render_adsense("4790829615", height=125)
 
 if detail_mode:
     def render_detail(result, selected_code):
-        code_options = result["代號"].astype(str).tolist()
-        if not code_options:
+        codes = result["代號"].astype(str).tolist()
+        if not codes:
             return
-
         selected_code = str(selected_code)
-        if selected_code not in code_options:
-            selected_code = code_options[0]
-
-        current_index = code_options.index(selected_code)
-        chosen_from_box = st.selectbox(
-            "選擇股票",
-            code_options,
-            index=current_index,
-            format_func=lambda x: (
-                f"{x} "
-                f"{result.loc[result['代號'].eq(x), '名稱'].iloc[0]}"
-            ),
+        if selected_code not in codes:
+            selected_code = codes[0]
+        chosen = st.selectbox(
+            "選擇股票", codes, index=codes.index(selected_code),
+            format_func=lambda x: f"{x} {result.loc[result['代號'].astype(str).eq(x), '名稱'].iloc[0]}",
             key="detail_stock_box",
         )
-
-        if chosen_from_box != selected_code:
-            st.query_params["stock"] = chosen_from_box
+        if chosen != selected_code:
+            st.query_params["stock"] = chosen
             st.rerun()
 
-        row = result[
-            result["代號"].eq(selected_code)
-        ].iloc[0]
+        stock = result[result["代號"].astype(str).eq(selected_code)].iloc[0]
+        st.markdown(f"### {stock['代號']} {stock['名稱']}〔{stock['市場']}〕")
+        st.caption("上方顯示營收年增率、月增率、季增率、EPS 與本益比；下方保留週K、月K線圖。正數紅色、負數綠色。")
 
-        code_value = row["代號"]
-        name_value = row["名稱"]
-        market_value = row["市場"]
+        with st.spinner("讀取各季及各月基本面資料…"):
+            quarterly, monthly = load_detail_fundamentals(stock["代號"], stock["市場"])
 
-        st.markdown(
-            f"### {code_value} {name_value}〔{market_value}〕"
-        )
+        def growth_style(v):
+            if pd.isna(v):
+                return ""
+            if v > 0:
+                return "color: #d62728; font-weight: 700"
+            if v < 0:
+                return "color: #159447; font-weight: 700"
+            return "color: #333333"
 
-        a, b, c, d, e, f = st.columns(6)
+        if quarterly.empty and monthly.empty:
+            st.warning("目前沒有取得這檔股票的歷史基本面資料，請稍後再試。")
+            # 即使基本面暫時無資料，也繼續顯示下方K線。
 
-        a.metric(
-            "今收股價",
-            f"{row['股價']:.2f}"
-            if pd.notna(row["股價"])
-            else "-",
-        )
-        b.metric(
-            "V2總分",
-            f"{row['V2總分']:.0f}/100",
-        )
-        c.metric(
-            "營收YoY（單月年增率）",
-            f"{row['月營收YoY']:.2f}%"
-            if pd.notna(row["月營收YoY"])
-            else "-",
-        )
-        st.caption(
-            f"營收MoM：{row['營收MoM']:.2f}%" if pd.notna(row["營收MoM"]) else "營收MoM：-"
-        )
-        d.metric(
-            "累計營收YoY",
-            f"{row['累計營收YoY']:.2f}%"
-            if pd.notna(row["累計營收YoY"])
-            else "-",
-        )
-        e.metric(
-            "EPS",
-            f"{row['EPS']:.2f}"
-            if pd.notna(row["EPS"])
-            else "-",
-        )
-        f.metric(
-            "PE",
-            f"{row['PE']:.2f}"
-            if pd.notna(row["PE"])
-            else "-",
-        )
+        if not quarterly.empty:
+            st.markdown("#### 各季營收成長率、EPS、本益比（最新在上）")
+            q = quarterly.copy()
+            q["季度營收"] = pd.to_numeric(q.get("季度營收"), errors="coerce")
+            q = q.sort_values("季度")
+            # 季增率為本季營收相對上一季（QoQ），與月增率 MoM 不同。
+            q["季增率QoQ(%)"] = q["季度營收"].pct_change(fill_method=None) * 100
+            q = q.sort_values("季度", ascending=False)
+            qview = pd.DataFrame({
+                "季度": q["季度"],
+                "年增率YoY(%)": pd.to_numeric(q.get("季度營收YoY"), errors="coerce"),
+                "季增率QoQ(%)": q["季增率QoQ(%)"],
+                "EPS(元)": pd.to_numeric(q.get("季EPS", pd.Series(index=q.index, dtype=float)), errors="coerce"),
+                "本益比PE": pd.Series(float("nan"), index=q.index),
+            })
+            # 最新 PE 是目前市場本益比，不可當作每一季的歷史 PE。
+            if pd.notna(stock.get("PE", float("nan"))) and not qview.empty:
+                qview.loc[qview.index[0], "本益比PE"] = float(stock["PE"])
+            numeric = [c for c in qview.columns if c != "季度"]
+            st.dataframe(qview.style.format({c: "{:.2f}" for c in numeric}, na_rep="—").map(growth_style, subset=numeric),
+                         use_container_width=True, hide_index=True)
+            st.caption("本益比只在最新一季列顯示目前的 PE（非該季歷史 PE）；其餘季度沒有可靠歷史值時留白。季度未結束時，季增率可能不具可比性。")
 
-        # 使用者指定：最重要的基本面放最上面，而且最新 → 舊。
-        st.markdown("#### ① 季度基本面（最新 → 舊）")
-        st.caption("每季列出該季 3 個月營收、各月年增率、季度營收年增率、單季 EPS 與該季末本益比。")
+        if not monthly.empty:
+            st.markdown("#### 各月營收年增率、月增率（最新在上）")
+            m = monthly.copy()
+            m["營收(千元)"] = pd.to_numeric(m["營收(千元)"], errors="coerce")
+            m = m.sort_values("年月")
+            m["月增率MoM(%)"] = m["營收(千元)"].pct_change(fill_method=None) * 100
+            mview = pd.DataFrame({
+                "年月": m["年月"],
+                "年增率YoY(%)": pd.to_numeric(m["YoY%"], errors="coerce"),
+                "月增率MoM(%)": m["月增率MoM(%)"],
+            }).sort_values("年月", ascending=False)
+            numeric = ["年增率YoY(%)", "月增率MoM(%)"]
+            st.dataframe(mview.style.format({c: "{:.2f}" for c in numeric}, na_rep="—").map(growth_style, subset=numeric),
+                         use_container_width=True, hide_index=True)
+            st.caption("EPS 是季度財報數字，本益比是行情估值，因此不將季度 EPS 或最新 PE 假裝成每月數據。")
 
-        with st.spinner("正在抓取歷史月營收、季度 EPS 與歷史本益比…"):
-            quarterly_detail, monthly_detail = load_detail_fundamentals(code_value, market_value)
-
-        if quarterly_detail.empty:
-            st.warning("目前抓不到這檔股票的歷史基本面資料，請稍後再試。")
-        else:
-            qshow = quarterly_detail.copy()
-            money_cols = [c for c in qshow.columns if "營收" in c]
-            for col in money_cols:
-                if col in qshow.columns:
-                    qshow[col] = pd.to_numeric(qshow[col], errors="coerce")
-            for col in ["季度營收", "1月營收", "2月營收", "3月營收", "4月營收", "5月營收", "6月營收", "7月營收", "8月營收", "9月營收", "10月營收", "11月營收", "12月營收"]:
-                if col in qshow.columns:
-                    qshow[col] = qshow[col].round(0)
-            for col in [c for c in qshow.columns if "YoY" in c]:
-                qshow[col] = qshow[col].round(2)
-            for col in ["季EPS", "季PE"]:
-                if col in qshow.columns:
-                    qshow[col] = qshow[col].round(2)
-
-            # 把季度內三個月整理成固定欄位，避免畫面出現不相關月份。
-            fixed_cols = [
-                "季度",
-                "1月營收", "1月YoY", "2月營收", "2月YoY", "3月營收", "3月YoY",
-                "季度營收", "季度營收YoY", "季EPS", "季PE",
-            ]
-            # 實際月份依季度不同，另外用較直覺的三欄顯示。
-            display_rows = []
-            for _, qr in quarterly_detail.iterrows():
-                q = str(qr["季度"])
-                # 季度格式固定為 YYYY Qn；避免 NaN 導致 int(NaN) 錯誤
-                mm = re.search(r"Q([1-4])$", q)
-                if not mm:
-                    continue
-                m = int(mm.group(1))
-                base_month = (m - 1) * 3 + 1
-                rr = {"季度": q}
-                for idx, month_no in enumerate(range(base_month, base_month + 3), start=1):
-                    rr[f"{month_no}月營收"] = qr.get(f"{month_no}月營收", np.nan)
-                    rr[f"{month_no}月YoY"] = qr.get(f"{month_no}月YoY", np.nan)
-                rr["季度營收"] = qr.get("季度營收", np.nan)
-                rr["季度營收YoY"] = qr.get("季度營收YoY", np.nan)
-                rr["季EPS"] = qr.get("季EPS", np.nan)
-                rr["季PE"] = qr.get("季PE", np.nan)
-                display_rows.append(rr)
-            qshow = pd.DataFrame(display_rows)
-
-            # 欄位依最新資料排序，每季由新到舊。
-            for col in qshow.columns:
-                if "營收" in col and "YoY" not in col:
-                    qshow[col] = pd.to_numeric(qshow[col], errors="coerce").round(0)
-                elif "YoY" in col:
-                    qshow[col] = pd.to_numeric(qshow[col], errors="coerce").round(2)
-                elif col in ["季EPS", "季PE"]:
-                    qshow[col] = pd.to_numeric(qshow[col], errors="coerce").round(2)
-
-            st.dataframe(qshow, use_container_width=True, hide_index=True)
-
-            if not monthly_detail.empty:
-                st.markdown("**最近36個月營收明細（最新 → 舊）**")
-                mshow = monthly_detail.copy()
-                mshow["營收(千元)"] = pd.to_numeric(mshow["營收(千元)"], errors="coerce").round(0)
-                mshow["YoY%"] = pd.to_numeric(mshow["YoY%"], errors="coerce").round(2)
-                st.dataframe(mshow, use_container_width=True, hide_index=True)
-
-        daily = load_daily(
-            code_value,
-            market_value,
-        )
+        # 下方保留原有週K、月K線圖；其他技術明細表不顯示。
+        with st.spinner("讀取官方歷史行情及K線…"):
+            daily = load_daily(str(stock["代號"]), str(stock["市場"]))
 
         if daily.empty:
-            st.warning(
-                "這檔股票目前抓不到官方歷史 K 線。"
-            )
+            st.warning("目前抓不到這檔股票的官方歷史K線資料，請稍後再試。")
         else:
+            daily = daily.copy()
+            daily.index = pd.to_datetime(daily.index, errors="coerce")
+            daily = daily[daily.index.notna()].sort_index()
+            weekly = add_bollinger(make_weekly(daily))
+            monthly_k = make_monthly(daily)
 
-            weekly = add_bollinger(
-                make_weekly(daily)
-            )
-            monthly = make_monthly(daily)
-
-            # 使用者指定：技術圖在下，週在上、月在下
-            st.markdown("#### ② 週K技術圖")
-
+            st.markdown("#### 週K技術圖")
             if not weekly.empty:
-
                 st.plotly_chart(
-                    candle_chart(
-                        weekly.tail(104),
-                        f"{code_value} 週K",
-                        show_bb=True,
-                    ),
+                    candle_chart(weekly.tail(104), f"{stock['代號']} 週K", show_bb=True),
                     use_container_width=True,
                 )
+            else:
+                st.info("目前沒有足夠的週K資料。")
 
-                recent_w = (
-                    weekly.tail(20)
-                    .sort_index(ascending=False)
-                    .copy()
-                )
-
-                # 雲端環境的官方資料索引有時會不是標準 DatetimeIndex，
-                # 先強制轉換，避免週K圖畫完後在表格這一步中斷，導致下面月K全部消失。
-                recent_w.index = pd.to_datetime(recent_w.index, errors="coerce")
-                recent_w = recent_w[recent_w.index.notna()]
-                recent_w.index = recent_w.index.strftime("%Y-%m-%d")
-
-                recent_w = recent_w[
-                    [
-                        "Open",
-                        "High",
-                        "Low",
-                        "Close",
-                        "Volume",
-                        "MA5",
-                        "MA12",
-                        "MA24",
-                    ]
-                ]
-
-                st.markdown(
-                    "**最近20週（新 → 舊）**"
-                )
-
-                st.dataframe(
-                    recent_w.round(2),
-                    use_container_width=True,
-                )
-
-            st.markdown("#### ③ 月K技術圖")
-
-            if not monthly.empty:
-
+            st.markdown("#### 月K技術圖")
+            if not monthly_k.empty:
                 st.plotly_chart(
-                    candle_chart(
-                        monthly.tail(60),
-                        f"{code_value} 月K",
-                    ),
+                    candle_chart(monthly_k.tail(60), f"{stock['代號']} 月K"),
                     use_container_width=True,
                 )
-
-                recent_m = (
-                    monthly.tail(24)
-                    .sort_index(ascending=False)
-                    .copy()
-                )
-
-                # 同樣保護月K資料索引，避免雲端資料格式差異造成後續畫面中斷。
-                recent_m.index = pd.to_datetime(recent_m.index, errors="coerce")
-                recent_m = recent_m[recent_m.index.notna()]
-                recent_m.index = recent_m.index.strftime("%Y-%m")
-
-                recent_m = recent_m[
-                    [
-                        "Open",
-                        "High",
-                        "Low",
-                        "Close",
-                        "Volume",
-                        "MA5",
-                        "MA12",
-                        "MA24",
-                    ]
-                ]
-
-                st.markdown(
-                    "**最近24個月（新 → 舊）**"
-                )
-
-                st.dataframe(
-                    recent_m.round(2),
-                    use_container_width=True,
-                )
+            else:
+                st.info("目前沒有足夠的月K資料。")
 
     render_detail(result, query_stock)
 
