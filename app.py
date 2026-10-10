@@ -1,6 +1,7 @@
 import re
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from io import StringIO
 
@@ -103,7 +104,7 @@ st.markdown(
 )
 
 page = str(st.query_params.get("page", "home")).strip().lower()
-if page not in {"home", "events", "futures"}:
+if page not in {"home", "events", "futures", "weekly"}:
     page = "home"
 
 # 品牌獨立放在左上角；導覽列只保留功能頁面。
@@ -119,6 +120,8 @@ st.markdown(
       <a class="nav-item" href="?page=home" target="_self">首頁</a>
       <span class="nav-sep">›</span>
       <a class="nav-item" href="?page=events" target="_self">近期事件（處置／除權息）</a>
+      <span class="nav-sep">›</span>
+      <a class="nav-item" href="?page=weekly" target="_self">週線選股</a>
       <span class="nav-sep">›</span>
       <a class="nav-item" href="?page=futures" target="_self">操盤心得</a>
     </div>
@@ -1398,12 +1401,12 @@ def render_events_page():
 
 def render_futures_diary():
     st.title("📖 操盤心得")
-    st.caption("這裡會是傑森自己的海期操盤日記。")
+    st.caption("這裡是操盤心得頁面。")
     st.markdown(
         """
         <div class="page-card">
-          <h3 style="margin-top:0;color:#7A3E00;">📝 操盤日記</h3>
-          <p>之後可以在這裡發表你的海期交易紀錄，例如：</p>
+          <h3 style="margin-top:0;color:#7A3E00;">📝 操盤心得</h3>
+          <p>之後可以在這裡發表你的交易紀錄，例如：</p>
           <ul>
             <li>交易日期與商品（NQ／MNQ 等）</li>
             <li>進場理由、出場理由</li>
@@ -1420,8 +1423,122 @@ def render_futures_diary():
 
 
 # =========================
+# 週線選股：MA12 轉上 + 收盤突破 + MACD(12,26,66) 柱狀體翻紅
+# =========================
+def weekly_signal_frame(daily, fast=12, slow=26, signal=66):
+    w = make_weekly(daily)
+    if w.empty:
+        return w
+    # 排除尚未結束的本週，避免盤中假訊號
+    now = pd.Timestamp.now()
+    this_friday = now.normalize() + pd.Timedelta(days=(4-now.weekday()) % 7)
+    if now.weekday() < 4:
+        w = w[w.index < this_friday]
+    elif now.weekday() == 4 and now.hour < 14:
+        w = w[w.index < this_friday]
+    close = w["Close"]
+    dif = close.ewm(span=fast, adjust=False, min_periods=fast).mean() - close.ewm(span=slow, adjust=False, min_periods=slow).mean()
+    dea = dif.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    w["DIF"] = dif
+    w["DEA"] = dea
+    w["MACD柱"] = (dif - dea) * 2
+    return w
+
+
+def weekly_signal_flags(w):
+    if len(w) < 4 or w[["MA12", "MACD柱"]].tail(3).isna().any().any():
+        return False, False, False
+    a, b, c = w.iloc[-3], w.iloc[-2], w.iloc[-1]
+    ma_turn = b["MA12"] <= a["MA12"] and c["MA12"] > b["MA12"]
+    price_cross = b["Close"] <= b["MA12"] and c["Close"] > c["MA12"]
+    macd_turn = b["MACD柱"] <= 0 and c["MACD柱"] > 0
+    return bool(ma_turn), bool(price_cross), bool(macd_turn)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def scan_one_weekly(code, market):
+    try:
+        # 66期訊號線需要較長暖機；抓約三年週K
+        d = load_daily(code, market, months=38)
+        w = weekly_signal_frame(d)
+        if w.empty or len(w) < 100:
+            return None
+        flags = weekly_signal_flags(w)
+        last = w.iloc[-1]
+        return {"代號":code, "市場":market, "週收盤價":float(last["Close"]),
+                "週MA12":float(last["MA12"]), "MACD柱":float(last["MACD柱"]),
+                "訊號日期":w.index[-1].strftime("%Y-%m-%d"),
+                "MA12剛轉上":flags[0], "股價剛站上":flags[1], "MACD剛翻紅":flags[2]}
+    except Exception:
+        return None
+
+
+def render_weekly_screener():
+    st.title("📈 週線選股")
+    st.caption("週線12週均線剛由下彎轉上彎 ＋ 週收盤價剛突破MA12 ＋ MACD(12,26,66)柱狀體剛由負轉正。只用已收完的週K判斷。")
+    st.info("MACD(12,26,66) 的 66 是週線訊號線週期，不是66個交易日；若你原本指的是日線66天，參數需要另行調整。")
+    count = st.selectbox("掃描範圍", [20, 50, 100, 300], index=0, key="weekly_count")
+    st.caption("為避免首頁自動掃描造成等待，本頁只有按下按鈕才抓取行情。首次下載約三年歷史行情可能較慢；後續使用快取。")
+    if st.button("🔎 開始週線選股", type="primary", key="weekly_run"):
+        with st.spinner("取得上市、上櫃股票名單…"):
+            universe = load_universe()
+            rev = load_revenue()
+            if not rev.empty:
+                universe = universe.merge(rev[["代號","市場","月營收YoY"]], on=["代號","市場"], how="left")
+                universe = universe.sort_values("月營收YoY", ascending=False, na_position="last")
+            selected = universe.head(count)
+        results = []
+        bar = st.progress(0, text="正在計算週線訊號…")
+        items = list(selected[["代號", "市場"]].itertuples(index=False, name=None))
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(scan_one_weekly, c, m):(c,m) for c,m in items}
+            for i, future in enumerate(as_completed(futures), 1):
+                result = future.result()
+                if result:
+                    results.append(result)
+                bar.progress(i / max(len(items), 1), text=f"已分析 {i}/{len(items)} 檔")
+        bar.empty()
+        st.session_state["weekly_results"] = pd.DataFrame(results)
+        st.session_state["weekly_universe"] = selected[["代號","市場","名稱"]].copy()
+    if "weekly_results" not in st.session_state:
+        return
+    raw = st.session_state["weekly_results"]
+    if raw.empty:
+        st.warning("本次無法取得足夠的官方歷史行情，請稍後重試。")
+        return
+    match = raw[raw[["MA12剛轉上","股價剛站上","MACD剛翻紅"]].all(axis=1)].copy()
+    st.metric("符合三項條件", len(match))
+    if match.empty:
+        st.info("本次掃描範圍內沒有三項條件同週成立的股票。")
+        return
+    match = match.merge(st.session_state["weekly_universe"], on=["代號","市場"], how="left")
+    st.dataframe(match[["代號","名稱","市場","訊號日期","週收盤價","週MA12","MACD柱"]].round(3), hide_index=True, use_container_width=True)
+    choices = match["代號"].astype(str).tolist()
+    code = st.selectbox("查看週K與MACD圖", choices, format_func=lambda c: f"{c} {match.loc[match['代號'].eq(c),'名稱'].iloc[0]}")
+    r = match[match["代號"].eq(code)].iloc[0]
+    with st.spinner("繪製週線圖…"):
+        w = weekly_signal_frame(load_daily(code, r["市場"], months=38))
+    if w.empty:
+        return
+    import plotly.graph_objects as go
+    fig = candle_chart(w.tail(100), f"{code} 週K + MA12")
+    st.plotly_chart(fig, use_container_width=True)
+    hist = w.tail(100)
+    fig2 = go.Figure()
+    fig2.add_bar(x=hist.index, y=hist["MACD柱"], name="MACD柱", marker_color=["#d62728" if v > 0 else "#159447" for v in hist["MACD柱"]])
+    fig2.add_scatter(x=hist.index, y=hist["DIF"], mode="lines", name="DIF")
+    fig2.add_scatter(x=hist.index, y=hist["DEA"], mode="lines", name="訊號線(66)")
+    fig2.update_layout(title="週線 MACD (12,26,66)", height=320, paper_bgcolor="#fff", plot_bgcolor="#fff")
+    st.plotly_chart(fig2, use_container_width=True)
+
+
+# =========================
 # 導覽頁面分流
 # =========================
+if page == "weekly":
+    render_weekly_screener()
+    st.stop()
+
 if page == "events":
     render_events_page()
     st.divider()
